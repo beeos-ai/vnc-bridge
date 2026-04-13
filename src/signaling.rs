@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -43,12 +44,67 @@ struct AnswerMessage {
     sdp: String,
 }
 
-pub async fn run(mqtt_url: String, token: String, topic: String, bridge: Bridge) -> Result<()> {
-    // rumqttc parse_url supports mqtt://, mqtts://, ws://, wss://
-    // Append client_id as query parameter
+/// Credentials for MQTT connection, refreshable via bootstrap.
+#[derive(Clone)]
+pub struct MqttCredentials {
+    pub mqtt_url: String,
+    pub token: String,
+    pub topic: String,
+}
+
+/// Token refresh callback: returns fresh credentials or None on failure.
+pub type TokenRefreshFn =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<MqttCredentials>> + Send>> + Send + Sync>;
+
+/// Run the signaling loop with automatic reconnection and token refresh.
+///
+/// When `refresh_fn` is provided, MQTT errors trigger a token refresh before
+/// reconnecting. This mirrors device-agent's MQTTManager behavior.
+pub async fn run(
+    initial_creds: MqttCredentials,
+    bridge: Bridge,
+    refresh_fn: Option<TokenRefreshFn>,
+) -> Result<()> {
+    let mut creds = initial_creds;
+    let mut backoff = 1u64;
+
+    loop {
+        match run_session(&creds, &bridge).await {
+            Ok(()) => {
+                info!("Signaling session ended cleanly");
+                return Ok(());
+            }
+            Err(e) => {
+                error!("MQTT session error: {e:#}");
+            }
+        }
+
+        info!("Reconnecting in {backoff}s...");
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(60);
+
+        if let Some(ref refresh) = refresh_fn {
+            info!("Refreshing MQTT credentials before reconnect...");
+            match (refresh)().await {
+                Some(new_creds) => {
+                    info!(topic = %new_creds.topic, "Credentials refreshed");
+                    creds = new_creds;
+                    backoff = 1;
+                }
+                None => {
+                    warn!("Token refresh failed, retrying with old credentials");
+                }
+            }
+        }
+    }
+}
+
+/// Run a single MQTT session until error or clean shutdown.
+async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
     let url_with_id = format!(
-        "{mqtt_url}{}client_id=vnc-bridge-{}",
-        if mqtt_url.contains('?') { "&" } else { "?" },
+        "{}{}client_id=vnc-bridge-{}",
+        creds.mqtt_url,
+        if creds.mqtt_url.contains('?') { "&" } else { "?" },
         std::process::id()
     );
 
@@ -57,14 +113,14 @@ pub async fn run(mqtt_url: String, token: String, topic: String, bridge: Bridge)
 
     opts.set_keep_alive(Duration::from_secs(30));
 
-    if !token.is_empty() {
-        opts.set_credentials("vnc-bridge", &token);
+    if !creds.token.is_empty() {
+        opts.set_credentials("vnc-bridge", &creds.token);
     }
 
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
 
-    let request_topic = format!("{topic}/signaling/request");
-    let response_topic = format!("{topic}/signaling/response");
+    let request_topic = format!("{}/signaling/request", creds.topic);
+    let response_topic = format!("{}/signaling/response", creds.topic);
 
     client
         .subscribe(&request_topic, QoS::AtLeastOnce)
@@ -149,8 +205,8 @@ pub async fn run(mqtt_url: String, token: String, topic: String, bridge: Bridge)
             }
             Ok(_) => {}
             Err(e) => {
-                error!("MQTT error: {e}, reconnecting in 3s...");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                error!("MQTT error: {e}");
+                return Err(anyhow::anyhow!("MQTT connection error: {e}"));
             }
         }
     }
