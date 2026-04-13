@@ -1,4 +1,8 @@
-//! Bidirectional pipe between VNC TCP connection and WebRTC DataChannel.
+//! Bidirectional pipe: VNC TCP ↔ WebRTC DataChannel.
+//!
+//! Bridge receives WebRTC offers via MQTT signaling, creates a PeerConnection,
+//! then pipes bytes between the VNC server (localhost TCP) and the browser
+//! (DataChannel). Only one active session at a time; new offers replace old ones.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -8,16 +12,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::signaling::IceServerConfig;
-use crate::webrtc_peer;
+use crate::webrtc_peer::{self, PeerSession};
 
-/// Buffered ICE candidate received before session is ready.
-struct PendingIce {
-    candidate: Option<serde_json::Value>,
-    sdp_mid: Option<String>,
-    sdp_mline_index: Option<u16>,
-}
-
-/// Bridge orchestrates the VNC <-> WebRTC DataChannel pipe.
 #[derive(Clone)]
 pub struct Bridge {
     vnc_addr: String,
@@ -28,8 +24,14 @@ pub struct Bridge {
 
 struct ActiveSession {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
-    _pipe_handles: Vec<tokio::task::JoinHandle<()>>,
+    pipe_handles: Vec<tokio::task::JoinHandle<()>>,
     created_at: std::time::Instant,
+}
+
+struct PendingIce {
+    candidate: Option<serde_json::Value>,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
 }
 
 impl Bridge {
@@ -43,61 +45,63 @@ impl Bridge {
     }
 
     pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String> {
-        // Close previous session, but only if it's old enough or already failed.
-        // This prevents rapid offer spam (e.g. React StrictMode double-mount)
-        // from killing a session that's still establishing its DataChannel.
+        // Tear down previous session if stale
         {
             let mut guard = self.session.lock().await;
             if let Some(ref old) = *guard {
                 let age = old.created_at.elapsed();
-                let pc_state = old.pc.connection_state();
+                let state = old.pc.connection_state();
                 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
                 if age < std::time::Duration::from_secs(10)
-                    && matches!(pc_state, RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting | RTCPeerConnectionState::Connected)
+                    && matches!(
+                        state,
+                        RTCPeerConnectionState::New
+                            | RTCPeerConnectionState::Connecting
+                            | RTCPeerConnectionState::Connected
+                    )
                 {
-                    info!(age_ms = age.as_millis(), ?pc_state, "Ignoring duplicate offer — active session still young");
+                    info!(age_ms = age.as_millis(), ?state, "Ignoring duplicate offer");
                     return Err(anyhow::anyhow!("duplicate offer ignored"));
                 }
             }
             if let Some(old) = guard.take() {
-                info!("Closing previous WebRTC session");
+                info!("Closing previous session");
                 let _ = old.pc.close().await;
-                for h in old._pipe_handles {
+                for h in old.pipe_handles {
                     h.abort();
                 }
             }
         }
 
-        let (answer_sdp, peer_session) =
+        let (answer_sdp, session) =
             webrtc_peer::handle_offer(offer_sdp, &self.ice_servers).await?;
 
-        let vnc_addr = self.vnc_addr.clone();
-        let pc = peer_session.pc.clone();
-        let dc_tx = peer_session.dc_tx;
-        let mut dc_rx = peer_session.dc_rx;
-        let dc_ready = peer_session.dc_ready;
+        let pc = session.pc.clone();
+        let handles = spawn_vnc_pipe(self.vnc_addr.clone(), session);
 
-        // Spawn the pipe tasks — VNC TCP connects only after DataChannel is open
-        let handles = spawn_pipe(vnc_addr, dc_tx, &mut dc_rx, dc_ready).await;
-
+        // Store active session
         {
             let mut guard = self.session.lock().await;
             *guard = Some(ActiveSession {
                 pc: pc.clone(),
-                _pipe_handles: handles,
+                pipe_handles: handles,
                 created_at: std::time::Instant::now(),
             });
         }
 
-        // Flush any ICE candidates that arrived before session was ready
-        let pending: Vec<PendingIce> = {
-            let mut buf = self.pending_ice.lock().await;
-            buf.drain(..).collect()
-        };
+        // Flush any ICE candidates that arrived before the session was ready
+        let pending: Vec<PendingIce> = self.pending_ice.lock().await.drain(..).collect();
         if !pending.is_empty() {
             info!(count = pending.len(), "Flushing buffered ICE candidates");
             for p in pending {
-                if let Err(e) = webrtc_peer::add_ice_candidate(&pc, p.candidate, p.sdp_mid, p.sdp_mline_index).await {
+                if let Err(e) = webrtc_peer::add_ice_candidate(
+                    &pc,
+                    p.candidate,
+                    p.sdp_mid,
+                    p.sdp_mline_index,
+                )
+                .await
+                {
                     warn!("Failed to add buffered ICE candidate: {e:#}");
                 }
             }
@@ -113,93 +117,85 @@ impl Bridge {
         sdp_mline_index: Option<u16>,
     ) -> Result<()> {
         let guard = self.session.lock().await;
-        if let Some(ref session) = *guard {
-            webrtc_peer::add_ice_candidate(&session.pc, candidate, sdp_mid, sdp_mline_index)
-                .await?;
+        if let Some(ref s) = *guard {
+            webrtc_peer::add_ice_candidate(&s.pc, candidate, sdp_mid, sdp_mline_index).await?;
         } else {
-            info!("Buffering ICE candidate (session not ready yet)");
             drop(guard);
-            let mut buf = self.pending_ice.lock().await;
-            buf.push(PendingIce { candidate, sdp_mid, sdp_mline_index });
+            self.pending_ice.lock().await.push(PendingIce {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            });
+            debug!("Buffered ICE candidate (no active session)");
         }
         Ok(())
     }
 }
 
-/// Spawn a task that waits for DataChannel to open, then connects to VNC
-/// and pipes data bidirectionally.
-///
-/// Returns task handles so they can be aborted when the session ends.
-async fn spawn_pipe(
-    vnc_addr: String,
-    dc_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    dc_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-    dc_ready: Arc<tokio::sync::Notify>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    // Take ownership of dc_rx for the spawned task
-    let mut dc_rx_owned = {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(tx);
-        std::mem::replace(dc_rx, rx)
-    };
+/// Spawn the VNC↔DC pipe. Waits for DC ready, connects TCP, then runs two
+/// forwarding loops until either side closes.
+fn spawn_vnc_pipe(vnc_addr: String, session: PeerSession) -> Vec<tokio::task::JoinHandle<()>> {
+    let PeerSession {
+        dc_rx,
+        dc_tx,
+        dc_ready,
+        ..
+    } = session;
 
-    let pipe_handle = tokio::spawn(async move {
-        info!("Waiting for DataChannel to open before connecting VNC...");
+    let handle = tokio::spawn(async move {
         dc_ready.notified().await;
-        info!("DataChannel open, connecting to VNC at {vnc_addr}");
+        info!("DataChannel ready, connecting VNC at {vnc_addr}");
 
         let tcp = match TcpStream::connect(&vnc_addr).await {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to connect to VNC at {vnc_addr}: {e}");
+                error!("VNC connect failed ({vnc_addr}): {e}");
                 return;
             }
         };
-
-        info!(addr = %vnc_addr, "Connected to VNC server");
+        info!("VNC connected (TCP)");
 
         let (mut tcp_read, tcp_write) = tcp.into_split();
         let tcp_write = Arc::new(Mutex::new(tcp_write));
+        let mut dc_rx = dc_rx;
 
-        // VNC -> DataChannel
+        // VNC→Browser: TCP read → dc_tx channel → (webrtc_peer) → DC.send
         let vnc_to_dc = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
                 match tcp_read.read(&mut buf).await {
                     Ok(0) => {
-                        info!("VNC connection closed");
+                        info!("VNC closed");
                         break;
                     }
                     Ok(n) => {
-                        debug!(bytes = n, "VNC -> DataChannel");
                         if dc_tx.send(buf[..n].to_vec()).await.is_err() {
-                            debug!("DataChannel sender dropped");
+                            debug!("DC tx dropped");
                             break;
                         }
                     }
                     Err(e) => {
-                        error!("VNC read error: {e}");
+                        error!("VNC read: {e}");
                         break;
                     }
                 }
             }
         });
 
-        // DataChannel -> VNC
+        // Browser→VNC: dc_rx channel ← (webrtc_peer) ← DC.on_message → TCP write
         let dc_to_vnc = tokio::spawn(async move {
-            while let Some(data) = dc_rx_owned.recv().await {
-                debug!(bytes = data.len(), "DataChannel -> VNC");
-                let mut writer = tcp_write.lock().await;
-                if let Err(e) = writer.write_all(&data).await {
-                    error!("VNC write error: {e}");
+            while let Some(data) = dc_rx.recv().await {
+                let mut w = tcp_write.lock().await;
+                if let Err(e) = w.write_all(&data).await {
+                    error!("VNC write: {e}");
                     break;
                 }
             }
-            info!("DataChannel -> VNC pipe ended");
         });
 
         let _ = tokio::join!(vnc_to_dc, dc_to_vnc);
+        info!("VNC pipe closed");
     });
 
-    vec![pipe_handle]
+    vec![handle]
 }

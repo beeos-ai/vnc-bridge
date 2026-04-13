@@ -101,7 +101,7 @@ pub async fn run(
 
 /// Run a single MQTT session until error or clean shutdown.
 async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
-    let client_id = format!("vnc-bridge-{}", std::process::id());
+    let client_id = format!("vnc-bridge-{}-{}", std::process::id(), rand::random::<u32>());
     let mut opts = parse_mqtt_url(&creds.mqtt_url, &client_id)?;
 
     opts.set_keep_alive(Duration::from_secs(30));
@@ -122,71 +122,77 @@ async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
 
     info!(topic = %request_topic, "Subscribed to signaling requests");
 
-    let (offer_tx, mut offer_rx) = mpsc::channel::<SignalingMessage>(8);
+    let (offer_tx, mut offer_rx) = mpsc::channel::<SignalingMessage>(4);
+    let (ice_tx, mut ice_rx) = mpsc::channel::<SignalingMessage>(32);
 
     let response_topic_clone = response_topic.clone();
     let client_clone = client.clone();
-    let bridge_clone = bridge.clone();
+    let bridge_for_offer = bridge.clone();
 
-    tokio::spawn(async move {
+    let offer_handle = tokio::spawn(async move {
         while let Some(msg) = offer_rx.recv().await {
-            match msg.msg_type.as_str() {
-                "offer" => {
-                    let sdp = match msg.sdp {
-                        Some(s) => s,
-                        None => {
-                            warn!("Offer missing SDP, ignoring");
-                            continue;
-                        }
-                    };
-
-                    info!("Processing WebRTC offer");
-                    match bridge_clone.handle_offer(&sdp).await {
-                        Ok(answer_sdp) => {
-                            let answer = AnswerMessage {
-                                msg_type: "answer".into(),
-                                sdp: answer_sdp,
-                            };
-                            let payload = serde_json::to_vec(&answer)
-                                .expect("AnswerMessage serialization cannot fail");
-                            if let Err(e) = client_clone
-                                .publish(&response_topic_clone, QoS::AtLeastOnce, false, payload)
-                                .await
-                            {
-                                error!("Failed to publish answer: {e}");
-                            } else {
-                                info!("Published WebRTC answer");
-                            }
-                        }
-                        Err(e) => warn!("Offer not processed: {e:#}"),
-                    }
+            let sdp = match msg.sdp {
+                Some(s) => s,
+                None => {
+                    warn!("Offer missing SDP, ignoring");
+                    continue;
                 }
-                "ice" => {
-                    debug!("Processing ICE candidate");
-                    if let Err(e) = bridge_clone
-                        .handle_ice_candidate(msg.candidate, msg.sdp_mid, msg.sdp_mline_index)
+            };
+
+            info!("Processing WebRTC offer");
+            match bridge_for_offer.handle_offer(&sdp).await {
+                Ok(answer_sdp) => {
+                    let answer = AnswerMessage {
+                        msg_type: "answer".into(),
+                        sdp: answer_sdp,
+                    };
+                    let payload = serde_json::to_vec(&answer)
+                        .expect("AnswerMessage serialization cannot fail");
+                    if let Err(e) = client_clone
+                        .publish(&response_topic_clone, QoS::AtLeastOnce, false, payload)
                         .await
                     {
-                        warn!("Failed to handle ICE candidate: {e:#}");
+                        error!("Failed to publish answer: {e}");
+                    } else {
+                        info!("Published WebRTC answer");
                     }
                 }
-                other => {
-                    warn!(msg_type = other, "Unknown signaling message type");
-                }
+                Err(e) => warn!("Offer not processed: {e:#}"),
+            }
+        }
+    });
+
+    let bridge_for_ice = bridge.clone();
+    let ice_handle = tokio::spawn(async move {
+        while let Some(msg) = ice_rx.recv().await {
+            debug!("Processing ICE candidate");
+            if let Err(e) = bridge_for_ice
+                .handle_ice_candidate(msg.candidate, msg.sdp_mid, msg.sdp_mline_index)
+                .await
+            {
+                warn!("Failed to handle ICE candidate: {e:#}");
             }
         }
     });
 
     info!("Waiting for signaling messages...");
-    loop {
+    let result = loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(publish))) => {
                 if publish.topic == request_topic {
                     match serde_json::from_slice::<SignalingMessage>(&publish.payload) {
                         Ok(msg) => {
-                            if offer_tx.send(msg).await.is_err() {
-                                error!("Offer channel closed");
-                                break;
+                            let send_result = match msg.msg_type.as_str() {
+                                "offer" => offer_tx.send(msg).await.map_err(|_| ()),
+                                "ice" => ice_tx.send(msg).await.map_err(|_| ()),
+                                other => {
+                                    warn!(msg_type = other, "Unknown signaling message type");
+                                    Ok(())
+                                }
+                            };
+                            if send_result.is_err() {
+                                error!("Channel closed");
+                                break Ok(());
                             }
                         }
                         Err(e) => warn!("Invalid signaling JSON: {e}"),
@@ -199,12 +205,19 @@ async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
             Ok(_) => {}
             Err(e) => {
                 error!("MQTT error: {e}");
-                return Err(anyhow::anyhow!("MQTT connection error: {e}"));
+                break Err(anyhow::anyhow!("MQTT connection error: {e}"));
             }
         }
-    }
+    };
 
-    Ok(())
+    drop(offer_tx);
+    drop(ice_tx);
+    offer_handle.abort();
+    ice_handle.abort();
+    let _ = client.disconnect().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    result
 }
 
 /// Parse an MQTT broker URL into MqttOptions, handling WebSocket paths correctly.
