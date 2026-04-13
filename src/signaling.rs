@@ -5,7 +5,7 @@
 //!   Publish:   `{topic}/signaling/response`
 
 use anyhow::{Context, Result};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,15 +101,8 @@ pub async fn run(
 
 /// Run a single MQTT session until error or clean shutdown.
 async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
-    let url_with_id = format!(
-        "{}{}client_id=vnc-bridge-{}",
-        creds.mqtt_url,
-        if creds.mqtt_url.contains('?') { "&" } else { "?" },
-        std::process::id()
-    );
-
-    let mut opts = MqttOptions::parse_url(&url_with_id)
-        .map_err(|e| anyhow::anyhow!("Invalid MQTT URL: {e}"))?;
+    let client_id = format!("vnc-bridge-{}", std::process::id());
+    let mut opts = parse_mqtt_url(&creds.mqtt_url, &client_id)?;
 
     opts.set_keep_alive(Duration::from_secs(30));
 
@@ -212,4 +205,47 @@ async fn run_session(creds: &MqttCredentials, bridge: &Bridge) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse an MQTT broker URL into MqttOptions, handling WebSocket paths correctly.
+///
+/// rumqttc's `MqttOptions::parse_url` drops the URL path (e.g. `/mqtt`), which
+/// breaks WebSocket connections. For Ws/Wss transport, rumqttc uses `broker_addr`
+/// as the full WebSocket URL internally, so we pass the original URL as the host.
+fn parse_mqtt_url(mqtt_url: &str, client_id: &str) -> Result<MqttOptions> {
+    let parsed = url::Url::parse(mqtt_url)
+        .with_context(|| format!("parse MQTT URL: {mqtt_url}"))?;
+
+    let host = parsed.host_str()
+        .ok_or_else(|| anyhow::anyhow!("MQTT URL missing host: {mqtt_url}"))?;
+    let scheme = parsed.scheme();
+
+    let (default_port, use_tls) = match scheme {
+        "mqtt" | "tcp" => (1883, false),
+        "mqtts" | "ssl" => (8883, true),
+        "ws" => (8000, false),
+        "wss" => (443, true),
+        _ => anyhow::bail!("unsupported MQTT URL scheme: {scheme}"),
+    };
+    let port = parsed.port().unwrap_or(default_port);
+
+    let is_ws = scheme == "ws" || scheme == "wss";
+
+    if is_ws {
+        // For WebSocket, broker_addr must be the full URL (rumqttc uses it for
+        // both TCP connect via split_url and the WS upgrade request).
+        let mut opts = MqttOptions::new(client_id, mqtt_url, port);
+        if use_tls {
+            opts.set_transport(Transport::Wss(rumqttc::TlsConfiguration::default()));
+        } else {
+            opts.set_transport(Transport::Ws);
+        }
+        Ok(opts)
+    } else {
+        let mut opts = MqttOptions::new(client_id, host, port);
+        if use_tls {
+            opts.set_transport(Transport::tls_with_default_config());
+        }
+        Ok(opts)
+    }
 }
