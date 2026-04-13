@@ -29,6 +29,7 @@ pub struct Bridge {
 struct ActiveSession {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     _pipe_handles: Vec<tokio::task::JoinHandle<()>>,
+    created_at: std::time::Instant,
 }
 
 impl Bridge {
@@ -42,9 +43,22 @@ impl Bridge {
     }
 
     pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String> {
-        // Close previous session
+        // Close previous session, but only if it's old enough or already failed.
+        // This prevents rapid offer spam (e.g. React StrictMode double-mount)
+        // from killing a session that's still establishing its DataChannel.
         {
             let mut guard = self.session.lock().await;
+            if let Some(ref old) = *guard {
+                let age = old.created_at.elapsed();
+                let pc_state = old.pc.connection_state();
+                use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                if age < std::time::Duration::from_secs(10)
+                    && matches!(pc_state, RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting | RTCPeerConnectionState::Connected)
+                {
+                    info!(age_ms = age.as_millis(), ?pc_state, "Ignoring duplicate offer — active session still young");
+                    return Err(anyhow::anyhow!("duplicate offer ignored"));
+                }
+            }
             if let Some(old) = guard.take() {
                 info!("Closing previous WebRTC session");
                 let _ = old.pc.close().await;
@@ -71,6 +85,7 @@ impl Bridge {
             *guard = Some(ActiveSession {
                 pc: pc.clone(),
                 _pipe_handles: handles,
+                created_at: std::time::Instant::now(),
             });
         }
 

@@ -2592,6 +2592,7 @@ dependencies = [
  "bytes",
  "clap",
  "rumqttc",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

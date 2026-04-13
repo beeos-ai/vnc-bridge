@@ -109,7 +109,7 @@ pub async fn run(mqtt_url: String, token: String, topic: String, bridge: Bridge)
                                 info!("Published WebRTC answer");
                             }
                         }
-                        Err(e) => error!("Failed to handle offer: {e:#}"),
+                        Err(e) => warn!("Offer not processed: {e:#}"),
                     }
                 }
                 "ice" => {

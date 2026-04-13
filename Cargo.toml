@@ -1,11 +1,12 @@
 [package]
 name = "vnc-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "VNC TCP <-> WebRTC DataChannel bridge with MQTT signaling"
 
 [dependencies]
 webrtc = "0.17"
+rustls = { version = "0.23", features = ["ring"] }
 rumqttc = { version = "0.25", features = ["websocket", "url"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
