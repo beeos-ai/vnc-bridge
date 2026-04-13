@@ -1,6 +1,6 @@
 [package]
 name = "vnc-bridge"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 description = "VNC TCP <-> WebRTC DataChannel bridge with MQTT signaling"
 

@@ -45,31 +45,31 @@ impl Bridge {
     }
 
     pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String> {
-        // Tear down previous session if stale
+        // Tear down previous session if exists
         {
             let mut guard = self.session.lock().await;
             if let Some(ref old) = *guard {
                 let age = old.created_at.elapsed();
                 let state = old.pc.connection_state();
                 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-                if age < std::time::Duration::from_secs(10)
-                    && matches!(
-                        state,
-                        RTCPeerConnectionState::New
-                            | RTCPeerConnectionState::Connecting
-                            | RTCPeerConnectionState::Connected
-                    )
+                if age < std::time::Duration::from_secs(5)
+                    && matches!(state, RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting)
                 {
-                    info!(age_ms = age.as_millis(), ?state, "Ignoring duplicate offer");
+                    info!(age_ms = age.as_millis(), ?state, "Ignoring duplicate offer (session still initializing)");
                     return Err(anyhow::anyhow!("duplicate offer ignored"));
                 }
             }
             if let Some(old) = guard.take() {
-                info!("Closing previous session");
+                info!("Closing previous WebRTC session");
                 let _ = old.pc.close().await;
                 for h in old.pipe_handles {
                     h.abort();
                 }
+                drop(guard);
+                // webrtc-rs ICE agent cleanup is async; yield briefly so
+                // mDNS sockets and UDP listeners are fully released before
+                // we create the next PeerConnection.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
 
