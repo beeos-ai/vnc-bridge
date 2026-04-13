@@ -3,7 +3,7 @@
 # Downloads the vnc-bridge binary and sets up systemd service (Linux)
 # or launchd plist (macOS).
 #
-# Usage: curl -fsSL https://beeos.ai/install-vnc-bridge | bash -s -- \
+# Usage: curl -fsSL https://raw.githubusercontent.com/beeos-ai/vnc-bridge/main/scripts/install.sh | bash -s -- \
 #          --mqtt wss://mqtt.beeos.ai/mqtt \
 #          --token <MQTT_TOKEN> \
 #          --topic devices/<INSTANCE_ID> \
@@ -54,7 +54,9 @@ done
 [[ -z "$MQTT_TOKEN" ]] && { echo "Error: --token is required"; usage; }
 [[ -z "$DEVICE_TOPIC" ]] && { echo "Error: --topic is required"; usage; }
 
-OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+REPO="beeos-ai/vnc-bridge"
+
+OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64|amd64) ARCH="x86_64";;
@@ -62,14 +64,26 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH"; exit 1;;
 esac
 
-echo "Installing vnc-bridge for $OS/$ARCH..."
+case "$OS" in
+  Linux)  TARGET="${ARCH}-unknown-linux-gnu";;
+  Darwin) TARGET="${ARCH}-apple-darwin";;
+  *) echo "Unsupported OS: $OS"; exit 1;;
+esac
 
-DOWNLOAD_URL="https://github.com/beeos-ai/beeos/releases/download/vnc-bridge-v${VERSION}/vnc-bridge-${OS}-${ARCH}"
+echo "Installing vnc-bridge for ${OS}/${ARCH} (target: ${TARGET})..."
+
 if [[ "$VERSION" == "latest" ]]; then
-  DOWNLOAD_URL="https://github.com/beeos-ai/beeos/releases/latest/download/vnc-bridge-${OS}-${ARCH}"
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/vnc-bridge-latest-${TARGET}.tar.gz"
+  VERSION_TAG="$(curl -fsSL -o /dev/null -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "latest")"
+  if [[ "$VERSION_TAG" != "latest" ]]; then
+    V="${VERSION_TAG#v}"
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION_TAG}/vnc-bridge-${V}-${TARGET}.tar.gz"
+  fi
+else
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/vnc-bridge-${VERSION}-${TARGET}.tar.gz"
 fi
 
-curl -fsSL "$DOWNLOAD_URL" -o /tmp/vnc-bridge
+curl -fsSL "$DOWNLOAD_URL" | tar -xz -C /tmp
 chmod +x /tmp/vnc-bridge
 sudo mv /tmp/vnc-bridge "${INSTALL_DIR}/vnc-bridge"
 
