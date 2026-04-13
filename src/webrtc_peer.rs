@@ -1,12 +1,9 @@
 //! WebRTC PeerConnection management.
 //!
-//! Answerer role: receives browser offer, returns answer with ICE candidates,
-//! and exposes a bidirectional byte channel for VNC piping.
-//!
-//! Design: DataChannel I/O is fully encapsulated inside the `on_data_channel`
-//! callback. No DC reference leaks out — the forwarding goroutine lives inside
-//! the callback closure, eliminating race conditions between DC readiness and
-//! data flow.
+//! Both browser (offerer) and vnc-bridge (answerer) create a negotiated
+//! DataChannel with `id=0`. This avoids relying on the `on_data_channel`
+//! callback path in webrtc-rs, which has known issues with `on_message`
+//! delivery on the answerer side for in-band negotiated channels.
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -15,8 +12,8 @@ use tracing::{debug, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -79,75 +76,69 @@ pub async fn handle_offer(
         Box::pin(async {})
     }));
 
+    // --- Create negotiated DataChannel (id=0) ---
+    // Both browser and vnc-bridge create a DC with negotiated=true, id=0.
+    // This ensures both sides share the same SCTP stream and avoids
+    // webrtc-rs on_data_channel callback issues with on_message delivery.
+    let dc = pc
+        .create_data_channel(
+            "vnc",
+            Some(RTCDataChannelInit {
+                ordered: Some(true),
+                protocol: Some("binary".to_string()),
+                negotiated: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("create negotiated data channel")?;
+
+    info!(label = %dc.label(), id = dc.id(), "Negotiated DataChannel created");
+
     // --- Bidirectional byte channels ---
-    //
-    //  Browser→VNC:  DC.on_message → browser_tx ~~~> browser_rx  (caller reads)
-    //  VNC→Browser:  (caller writes) vnc_tx ~~~> vnc_rx → DC.send  (spawned inside on_data_channel)
-    //
     let (browser_tx, browser_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (vnc_tx, vnc_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (vnc_tx, mut vnc_rx) = mpsc::channel::<Vec<u8>>(256);
 
     let dc_ready = Arc::new(Notify::new());
-    let dc_ready_for_cb = dc_ready.clone();
+    let dc_ready_clone = dc_ready.clone();
 
-    // on_data_channel is FnMut but we only expect one DC per session.
-    // Wrap move-once values in Arc<std::sync::Mutex<Option<T>>> for take().
-    let browser_tx_slot = Arc::new(std::sync::Mutex::new(Some(browser_tx)));
-    let vnc_rx_slot = Arc::new(std::sync::Mutex::new(Some(vnc_rx)));
-    let ready_slot = Arc::new(std::sync::Mutex::new(Some(dc_ready_for_cb)));
+    // VNC→Browser forwarder (spawned on DC open)
+    let dc_for_fwd = dc.clone();
+    dc.on_open(Box::new(move || {
+        info!("DataChannel open");
+        dc_ready_clone.notify_waiters();
 
-    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-        let tx = match browser_tx_slot.lock().unwrap().take() {
-            Some(v) => v,
-            None => {
-                warn!("Duplicate DataChannel ignored");
-                return Box::pin(async {});
+        let dc = dc_for_fwd.clone();
+        tokio::spawn(async move {
+            let mut count: u64 = 0;
+            let mut total: u64 = 0;
+            while let Some(data) = vnc_rx.recv().await {
+                count += 1;
+                total += data.len() as u64;
+                if count <= 10 || count % 500 == 0 {
+                    debug!(len = data.len(), total, count, "DC.send (VNC→Browser)");
+                }
+                let buf = bytes::Bytes::copy_from_slice(&data);
+                if let Err(e) = dc.send(&buf).await {
+                    warn!("DC send error: {e}");
+                    break;
+                }
             }
-        };
-        let rx = vnc_rx_slot.lock().unwrap().take().unwrap();
-        let ready = ready_slot.lock().unwrap().take().unwrap();
+            debug!("VNC→DC forwarder ended");
+        });
 
-        info!(label = %dc.label(), "DataChannel negotiated");
+        Box::pin(async {})
+    }));
 
+    // Browser→VNC: DC.on_message → browser_tx channel
+    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+        let tx = browser_tx.clone();
         Box::pin(async move {
-            let dc_for_fwd = dc.clone();
-
-            // on_open is Fn (not FnOnce), so wrap move-once values for take().
-            let rx_cell = Arc::new(std::sync::Mutex::new(Some(rx)));
-            let ready_cell = Arc::new(std::sync::Mutex::new(Some(ready)));
-
-            dc.on_open(Box::new(move || {
-                if let Some(ready) = ready_cell.lock().unwrap().take() {
-                    info!("DataChannel open");
-                    ready.notify_waiters();
-                }
-
-                if let Some(rx) = rx_cell.lock().unwrap().take() {
-                    let dc = dc_for_fwd.clone();
-                    let mut rx = rx;
-                    tokio::spawn(async move {
-                        while let Some(data) = rx.recv().await {
-                            let buf = bytes::Bytes::copy_from_slice(&data);
-                            if let Err(e) = dc.send(&buf).await {
-                                warn!("DC send error: {e}");
-                                break;
-                            }
-                        }
-                        debug!("VNC→DC forwarder ended");
-                    });
-                }
-
-                Box::pin(async {})
-            }));
-
-            dc.on_message(Box::new(move |msg: DataChannelMessage| {
-                let tx = tx.clone();
-                Box::pin(async move {
-                    let _ = tx.send(msg.data.to_vec()).await;
-                })
-            }));
+            let _ = tx.send(msg.data.to_vec()).await;
         })
     }));
+
+    info!("on_message handler registered on negotiated DC");
 
     // --- SDP exchange ---
     let offer = RTCSessionDescription::offer(offer_sdp.to_string())?;

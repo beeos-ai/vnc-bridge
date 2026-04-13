@@ -162,6 +162,8 @@ fn spawn_vnc_pipe(vnc_addr: String, session: PeerSession) -> Vec<tokio::task::Jo
         // VNC→Browser: TCP read → dc_tx channel → (webrtc_peer) → DC.send
         let vnc_to_dc = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
+            let mut total: u64 = 0;
+            let mut count: u64 = 0;
             loop {
                 match tcp_read.read(&mut buf).await {
                     Ok(0) => {
@@ -169,8 +171,13 @@ fn spawn_vnc_pipe(vnc_addr: String, session: PeerSession) -> Vec<tokio::task::Jo
                         break;
                     }
                     Ok(n) => {
+                        total += n as u64;
+                        count += 1;
+                        if count <= 10 || count % 500 == 0 {
+                            debug!(n, total, count, "VNC→DC");
+                        }
                         if dc_tx.send(buf[..n].to_vec()).await.is_err() {
-                            debug!("DC tx dropped");
+                            warn!("DC tx dropped (receiver closed)");
                             break;
                         }
                     }
@@ -184,7 +191,14 @@ fn spawn_vnc_pipe(vnc_addr: String, session: PeerSession) -> Vec<tokio::task::Jo
 
         // Browser→VNC: dc_rx channel ← (webrtc_peer) ← DC.on_message → TCP write
         let dc_to_vnc = tokio::spawn(async move {
+            let mut total: u64 = 0;
+            let mut count: u64 = 0;
             while let Some(data) = dc_rx.recv().await {
+                total += data.len() as u64;
+                count += 1;
+                if count <= 10 || count % 500 == 0 {
+                    debug!(len = data.len(), total, count, "Browser→VNC");
+                }
                 let mut w = tcp_write.lock().await;
                 if let Err(e) = w.write_all(&data).await {
                     error!("VNC write: {e}");
