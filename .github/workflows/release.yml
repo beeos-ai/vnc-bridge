@@ -25,6 +25,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -52,8 +55,13 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          ARCHIVE="vnc-bridge-${VERSION}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" vnc-bridge
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            ARCHIVE="vnc-bridge-${VERSION}-${{ matrix.target }}.zip"
+            7z a "$ARCHIVE" "./target/${{ matrix.target }}/release/vnc-bridge.exe"
+          else
+            ARCHIVE="vnc-bridge-${VERSION}-${{ matrix.target }}.tar.gz"
+            tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" vnc-bridge
+          fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload artifact

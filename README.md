@@ -29,6 +29,8 @@ All CLI flags can also be set via environment variables:
 
 ## Install (self-hosted)
 
+### Linux / macOS
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/beeos-ai/vnc-bridge/main/scripts/install.sh | bash -s -- \
   --mqtt wss://mqtt.beeos.ai/mqtt \
@@ -37,6 +39,20 @@ curl -fsSL https://raw.githubusercontent.com/beeos-ai/vnc-bridge/main/scripts/in
 ```
 
 The installer downloads the correct binary for your OS/arch, installs it to `/usr/local/bin`, and sets up systemd (Linux) or launchd (macOS) for auto-start.
+
+### Windows (PowerShell)
+
+```powershell
+.\install.ps1 -Mqtt wss://mqtt.beeos.ai/mqtt -Token <TOKEN> -Topic devices/<ID>
+```
+
+Downloads the binary to `C:\Program Files\BeeOS`, writes config to `%APPDATA%\BeeOS\vnc-bridge.env`, and registers a Windows Service. Requires Administrator for service registration.
+
+To run manually without installing as a service:
+
+```powershell
+vnc-bridge.exe --vnc 127.0.0.1:5900 --mqtt wss://mqtt.beeos.ai/mqtt --token <TOKEN> --topic devices/<ID>
+```
 
 ## Build from source
 
