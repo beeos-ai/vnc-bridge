@@ -12,7 +12,7 @@ use crate::bootstrap::AgentKeyPair;
 use crate::signaling::{MqttCredentials, TokenRefreshFn};
 
 #[derive(Parser, Debug)]
-#[command(name = "vnc-bridge", about = "VNC TCP <-> WebRTC DataChannel bridge")]
+#[command(name = "vnc-bridge", about = "VNC TCP <-> WebRTC DataChannel bridge", version)]
 struct Args {
     /// VNC server address (host:port)
     #[arg(long, env = "VNC_ADDR", default_value = "127.0.0.1:5900")]
@@ -59,6 +59,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "vnc-bridge starting"
+    );
 
     if args.gateway.is_some() && args.key_file.is_some() {
         run_bootstrap_mode(args).await
