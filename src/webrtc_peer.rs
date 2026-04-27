@@ -20,6 +20,7 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -52,6 +53,7 @@ pub async fn handle_offer(
     // candidates and ICE permanently failed. Pinning to Udp4 sidesteps the bug.
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_network_types(vec![NetworkType::Udp4]);
+    info!("SettingEngine configured with network_types=[Udp4]");
 
     let api = APIBuilder::new()
         .with_media_engine(me)
@@ -59,6 +61,11 @@ pub async fn handle_offer(
         .with_setting_engine(setting_engine)
         .build();
 
+    // Belt-and-suspenders: even if SettingEngine.set_network_types is somehow
+    // bypassed inside webrtc-rs 0.17.1, ice_transport_policy=Relay forces the
+    // browser↔agent path through TURN (turn.beeos.ai), which has no IPv6
+    // resolution issue. This is the supported escape hatch documented in
+    // RFC 8829 §5.5 (`iceTransportPolicy: "relay"`).
     let config = RTCConfiguration {
         ice_servers: ice_servers
             .iter()
@@ -69,8 +76,13 @@ pub async fn handle_offer(
                 ..Default::default()
             })
             .collect(),
+        ice_transport_policy: RTCIceTransportPolicy::Relay,
         ..Default::default()
     };
+    info!(
+        ice_servers_count = ice_servers.len(),
+        "RTCConfiguration: ice_transport_policy=Relay (TURN-only)"
+    );
 
     let pc = Arc::new(api.new_peer_connection(config).await?);
 
@@ -86,6 +98,15 @@ pub async fn handle_offer(
 
     pc.on_peer_connection_state_change(Box::new(|state| {
         info!("PeerConnection state: {state}");
+        Box::pin(async {})
+    }));
+
+    pc.on_ice_candidate(Box::new(|c| {
+        if let Some(cand) = c {
+            info!(candidate = %cand.to_string(), "Local ICE candidate gathered");
+        } else {
+            info!("Local ICE gathering done (null candidate)");
+        }
         Box::pin(async {})
     }));
 
