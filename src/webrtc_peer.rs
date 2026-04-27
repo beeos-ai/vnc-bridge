@@ -11,9 +11,11 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::ice::network_type::NetworkType;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -41,9 +43,20 @@ pub async fn handle_offer(
     me.register_default_codecs()?;
     let mut registry = Registry::new();
     registry = register_default_interceptors(registry, &mut me)?;
+
+    // Force IPv4-only ICE gathering. Our deploy targets (ECS Fargate awsvpc ENI,
+    // EKS pods) run on IPv4-only VPCs, and the configured STUN/TURN servers
+    // (stun.l.google.com, turn.beeos.ai) have no AAAA records. Letting webrtc-rs
+    // try IPv6 triggers webrtc-rs/webrtc#774: when IPv6 host resolution fails it
+    // aborts the IPv4 path as well, leaving the agent with zero srflx/relay
+    // candidates and ICE permanently failed. Pinning to Udp4 sidesteps the bug.
+    let mut setting_engine = SettingEngine::default();
+    setting_engine.set_network_types(vec![NetworkType::Udp4]);
+
     let api = APIBuilder::new()
         .with_media_engine(me)
         .with_interceptor_registry(registry)
+        .with_setting_engine(setting_engine)
         .build();
 
     let config = RTCConfiguration {
