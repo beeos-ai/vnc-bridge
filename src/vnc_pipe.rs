@@ -45,22 +45,19 @@ impl Bridge {
     }
 
     pub async fn handle_offer(&self, offer_sdp: &str) -> Result<String> {
-        // Tear down previous session if exists
+        // Always answer a new offer. The viewer has already discarded the
+        // previous PeerConnection when it publishes a new SDP (reconnect,
+        // StrictMode remount, ICE restart). Ignoring Connecting offers left
+        // this process answering a PC the browser no longer owns; ICE then
+        // failed and the desktop overlay stuck on "disconnected".
         {
             let mut guard = self.session.lock().await;
-            if let Some(ref old) = *guard {
-                let age = old.created_at.elapsed();
-                let state = old.pc.connection_state();
-                use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-                if age < std::time::Duration::from_secs(5)
-                    && matches!(state, RTCPeerConnectionState::New | RTCPeerConnectionState::Connecting)
-                {
-                    info!(age_ms = age.as_millis(), ?state, "Ignoring duplicate offer (session still initializing)");
-                    return Err(anyhow::anyhow!("duplicate offer ignored"));
-                }
-            }
             if let Some(old) = guard.take() {
-                info!("Closing previous WebRTC session");
+                info!(
+                    age_ms = old.created_at.elapsed().as_millis(),
+                    state = ?old.pc.connection_state(),
+                    "Closing previous WebRTC session for new offer"
+                );
                 let _ = old.pc.close().await;
                 for h in old.pipe_handles {
                     h.abort();
