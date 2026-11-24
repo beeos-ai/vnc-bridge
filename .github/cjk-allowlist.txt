@@ -1,0 +1,1 @@
+# CJK lines allowed in this English-only repository (scripts/cjk_check.py): <path glob> | <line regex or empty> | <reason>
